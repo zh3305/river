@@ -91,16 +91,20 @@ namespace RiverApp
 				}
 			}
 
-			foreach (var (server, uri) in servers)
-			{
-				foreach (var fwd in forwarders)
-				{
-					server.Chain.Add(fwd);
-				}
-				server.Run(uri);
-			}
+            for (var index = 0; index < servers.Count; index++)
+            {
+                var (server, uri) = servers[index];
+                // for (var i = 0; i < forwarders.Count; i++)
+                {
+                    // var fwd = forwarders[i];
+                    var fwd = forwarders[index];
+                    server.Chain.Add(fwd);
+                }
 
-			return servers.Any();
+                server.Run(uri);
+            }
+
+            return servers.Any();
 		}
 	}
 }

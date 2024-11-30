@@ -337,7 +337,8 @@ namespace River
 			{
 				while (!IsDisposed)
 				{
-					var c = Stream.Read(_buffer, _bufferReceivedCount, _buffer.Length - _bufferReceivedCount);
+                    if (Client.Available <= 0) continue;
+                    var c = Stream.Read(_buffer, _bufferReceivedCount, _buffer.Length - _bufferReceivedCount);
 					Trace.WriteLine(TraceCategory.ObjectLive, $"Unlocked thread {Thread.CurrentThread.Name}");
 					if (!SourceReceived(c))
 					{

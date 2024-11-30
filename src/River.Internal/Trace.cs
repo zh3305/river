@@ -20,8 +20,9 @@ namespace River
 		public static TraceCategory Networking = new TraceCategory("networking");
 		public static TraceCategory NetworkingData = new TraceCategory("networking/data");
 		public static TraceCategory Performance = new TraceCategory("performance");
+        public static TraceCategory NetworkingError { get; set; } = new TraceCategory("NetworkingError");
 
-		private readonly string _category;
+        private readonly string _category;
 
 		TraceCategory(string category)
 		{
@@ -30,7 +31,8 @@ namespace River
 			_category = category;
 		}
 
-		public override string ToString() => _category;
+
+        public override string ToString() => _category;
 	}
 
 	public class Trace

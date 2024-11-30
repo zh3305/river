@@ -344,7 +344,8 @@ namespace River.Socks
 											catch (Exception exx)
 											{
 												ex = exx;
-											}
+                                                Trace.WriteLine(TraceCategory.NetworkingError, $"通讯错误: {ex.Message}");
+                                            }
 
 											// it appears, not all clients can handle domain name response...
 											// Hello to Telegram & QT platform.

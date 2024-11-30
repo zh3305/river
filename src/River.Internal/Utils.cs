@@ -35,7 +35,7 @@ namespace River
 					catch (Exception ex)
 					{
 						exResult = ex;
-						// Trace.TraceError(ex.ToString());
+						 // Trace.TraceError(ex.ToString());
 					}
 				});
 				th.IsBackground = true;
