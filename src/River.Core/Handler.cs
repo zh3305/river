@@ -430,6 +430,16 @@ namespace River
                     return;
                 }
 
+                // 生成代理链的唯一键
+                var key = new System.Text.StringBuilder();
+                foreach (var proxy in Server.Chain)
+                {
+                    key.Append(proxy.Uri.ToString()).Append('|');
+                }
+                key.Append(target.Host ?? target.IPAddress.ToString()).Append(':').Append(target.Port);
+
+                //打印代理链
+                Trace.WriteLine(TraceCategory.Networking, $"代理链: {key}");
                 // 处理代理链
                 foreach (var proxy in Server.Chain)
                 {
