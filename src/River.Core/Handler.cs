@@ -1,692 +1,648 @@
 ﻿using River.Common;
 using River.Internal;
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
 
 namespace River
 {
-	/// <summary>
-	/// Handles incomming connection for server.
-	/// Created and owned by server.
-	/// Handler - is a servant for client. Client is the boss.
-	/// Handler must satisfy client as much as possible, compensate all client mistakes and be graceful with him.
-	/// </summary>
-	public abstract class Handler : IDisposable
-	{
-		protected static Trace Trace = River.Trace.Default;
+    /// <summary>
+    /// 处理服务器的传入连接
+    /// 由服务器创建和拥有
+    /// Handler 作为客户端的服务者，客户端是老板
+    /// Handler 必须尽可能满足客户端需求，补偿客户端的所有错误，并对其保持优雅
+    /// </summary>
+    public abstract class Handler : IDisposable
+    {
+        // 日志追踪器
+        protected static readonly Trace Trace = River.Trace.Default;
+
+        // 定义常量
+        private const int BUFFER_SIZE = 16 * 1024;
+        private const int DEFAULT_TIMEOUT = 30000; // 30秒超时
+        private const int THREAD_JOIN_TIMEOUT = 1000; // 线程Join超时时间
 
 #if DEBUG
-		static Encoding _utf8 = new UTF8Encoding(false, false);
+        private static readonly Encoding _utf8 = new UTF8Encoding(false, false);
 #endif
+        // 基础属性
+        protected Stream Stream { get; private set; }
+        protected byte[] _buffer = new byte[BUFFER_SIZE];
+        protected byte[] _bufferTarget = new byte[BUFFER_SIZE];
+        protected int _bufferReceivedCount;
+        protected RiverServer Server { get; private set; }
+        protected TcpClient Client { get; private set; }
 
-		protected Stream Stream { get; private set; }
-		protected byte[] _buffer = new byte[16 * 1024];
-		protected int _bufferReceivedCount;
-		protected byte[] _bufferTarget = new byte[16 * 1024];
-		protected RiverServer Server { get; private set; }
-		protected TcpClient Client { get; private set; }
+        // 线程相关
+        private Thread _sourceReaderThread;
+        private Thread _targetReaderThread;
+        private Stream _upstreamClient;
+        private DestinationIdentifier _target;
+        private readonly object _disposingSync = new object();
 
-		private Thread _sourceReaderThread;
-		private Thread _targetReaderThread;
-		private Stream _upstreamClient;
-		private DestinationIdentifier _target;
-		private bool _isResigned;
-		private bool _isReadHandshake = true;
-		private object _disposingSync = new object();
+        // 状态标志
+        private bool _isResigned;
+        private bool _isReadHandshake = true;
+        protected bool IsDisposed { get; private set; }
+        private string _disposedComment;
 
-		public Handler()
-		{
-			// StatService.Instance.HandlerAdd(this);
-			ObjectTracker.Default.Register(this, 10, true);
-		}
+        protected bool IsResigned
+        {
+            get => _isResigned;
+            set
+            {
+                if (_targetReaderThread != null)
+                {
+                    throw new InvalidOperationException("无法在目标读取线程存在时注销Handler");
+                }
+                _isResigned = value;
+            }
+        }
 
-		public Handler(RiverServer server, TcpClient client)
-			: this()
-		{
-			Init(server, client);
-		}
+        /// <summary>
+        /// 源端口信息
+        /// </summary>
+        protected string Source => $"{Client?.GetHashCode():X4} {Client?.Client?.RemoteEndPoint}";
 
-		protected virtual Stream WrapStream(Stream stream)
-		{
-			return stream;
-		}
+        /// <summary>
+        /// 目标端口信息
+        /// </summary>
+        protected string Destination
+        {
+            get
+            {
+                if (_target != null)
+                {
+                    return $"{_target.Host}{_target.IPAddress}:{_target.Port}";
+                }
+                if (_upstreamClient is ClientStream cs)
+                {
+                    return cs?.Client?.Client?.RemoteEndPoint?.ToString();
+                }
+                return null;
+            }
+        }
 
-		/// <summary>
-		/// This offset can improve performance of HTTP header reshake / insert
-		/// </summary>
-		protected virtual int HandshakeStartPos { get => 0; }
+        /// <summary>
+        /// 构造函数
+        /// </summary>
+        public Handler()
+        {
+            ObjectTracker.Default.Register(this, 10, true);
+        }
 
-		/*
-		public void SwitchFrom(Handler handler, RiverServer server, ReStream stream)
-		{
-			if (handler is null)
-			{
-				throw new ArgumentNullException(nameof(handler));
-			}
+        /// <summary>
+        /// 带参数的构造函数
+        /// </summary>
+        public Handler(RiverServer server, TcpClient client) : this()
+        {
+            Init(server, client);
+        }
 
-			if (server is null)
-			{
-				throw new ArgumentNullException(nameof(server));
-			}
+        /// <summary>
+        /// 初始化处理程序
+        /// </summary>
+        public void Init(RiverServer server, TcpClient client, Stream stream = null)
+        {
+            Server = server ?? throw new ArgumentNullException(nameof(server));
+            Client = client ?? throw new ArgumentNullException(nameof(client));
 
-			if (stream is null)
-			{
-				throw new ArgumentNullException(nameof(stream));
-			}
+            // 禁用 Nagle 算法以提高性能
+            Client.Client.NoDelay = true;
 
-			// you must be sure that previous readers is readed and that is not subscribed yet!!
-			// you must be sure there is no forward connection already established
-			// you must be sure that previous handler did not sent any response to client yet!!
+            // 设置超时时间
+            Client.ReceiveTimeout = DEFAULT_TIMEOUT;
+            Client.SendTimeout = DEFAULT_TIMEOUT;
 
-			// init
-			stream.ResetReader();
-			Init(server ?? handler.Server, handler.Client, stream);
+            Stream = WrapStream(stream ?? Client.GetStream2());
 
+            BeginSourceReader();
+            ReadMoreHandshake();
+        }
 
-			// copy fields
-			// _buffer = handler._buffer;
-			// _bufferReceivedCount = handler._bufferReceivedCount;
+        /// <summary>
+        /// 包装流，可被子类重写以添加额外的流处理
+        /// </summary>
+        protected virtual Stream WrapStream(Stream stream) => stream;
 
-			// Client = handler.Client;
-			// Server = server ?? handler.Server;
-			// Stream = handler.Stream; // what about stream wrapper? like http wrap
+        /// <summary>
+        /// 握手起始位置，可被子类重写以优化HTTP头部处理
+        /// </summary>
+        protected virtual int HandshakeStartPos => 0;
 
-			// re-handshake
-			// HandshakeHandler();
-		}
-		*/
+        /// <summary>
+        /// 开始数据流传输
+        /// </summary>
+        protected void BeginStreaming()
+        {
+            BeginReadSource();
+            BeginReadTarget();
+        }
 
-		public void Init(RiverServer server, TcpClient client, Stream stream = null)
-		{
-			Server = server ?? throw new ArgumentNullException(nameof(server));
-			Client = client ?? throw new ArgumentNullException(nameof(client));
+        /// <summary>
+        /// 处理握手数据
+        /// </summary>
+        protected abstract void HandshakeHandler();
 
-			// disable Nagle, carefully do write operations to prevent extra TCP transfers
-			// efficient write should contain complete packet for corresponding protocol
-			Client.Client.NoDelay = true;
+        /// <summary>
+        /// 确保读取了指定数量的数据
+        /// </summary>
+        protected bool EnsureReaded(int readed)
+        {
+            if (_bufferReceivedCount < readed)
+            {
+                ReadMoreHandshake();
+                return false;
+            }
+            return true;
+        }
 
-			Stream = WrapStream(stream ?? Client.GetStream2());
+        /// <summary>
+        /// 读取更多握手数据
+        /// </summary>
+        protected void ReadMoreHandshake()
+        {
+            // 实现在SourceReaderThreadWorker中的循环读取中
+        }
 
-			BeginSourceReader();
-			ReadMoreHandshake();
-		}
+        /// <summary>
+        /// 开始源数据读取
+        /// </summary>
+        protected void BeginReadSource()
+        {
+            if (IsDisposed)
+                throw new ObjectDisposedException(nameof(Handler));
 
-#region Dispose
+            Profiling.Stamp(TraceCategory.Misc, "开始读取源数据...");
 
-		protected bool IsDisposed { get; private set; }
-		string _disposedComment;
+            _isReadHandshake = false;
+            _bufferReceivedCount = 0;
+        }
 
-		protected bool IsResigned
-		{
-			get => _isResigned;
-			set
-			{
-				if (_targetReaderThread != null)
-				{
-					throw new Exception("Can not Resign Handler");
-				}
-				_isResigned = value;
-			}
-		}
+        /// <summary>
+        /// 源数据读取线程工作方法
+        /// </summary>
+        private void SourceReaderThreadWorker()
+        {
+            Trace.WriteLine(TraceCategory.ObjectLive, $"启动线程 {Thread.CurrentThread.Name}");
+            try
+            {
+                while (!IsDisposed)
+                {
+                    // 优化：仅在有可用数据时才读取
+                    if (Client.Client != null && Client.Available > 0)
+                    {
+                        var bytesRead = Stream.Read(_buffer, _bufferReceivedCount, _buffer.Length - _bufferReceivedCount);
 
-		public void Dispose()
-		{
-			Dispose(true);
-			// GC.SuppressFinalize(this);
-		}
+                        if (!SourceReceived(bytesRead))
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // 避免CPU空转
+                        Thread.Sleep(1);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex.IsConnectionClosing())
+            {
+                // 正常的连接关闭，无需特殊处理
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"源数据读取错误: {ex}");
+            }
+            finally
+            {
+                Dispose();
+                Trace.WriteLine(TraceCategory.ObjectLive, $"关闭线程 {Thread.CurrentThread.Name}");
+            }
+        }
 
-		/*
-		~Handler()
-		{
-			Dispose(false);
-		}
-		*/
+        /// <summary>
+        /// 处理接收到的源数据
+        /// </summary>
+        private bool SourceReceived(int bytesRead)
+        {
+            if (IsDisposed || bytesRead <= 0)
+            {
+                Dispose();
+                return false;
+            }
 
-		public override string ToString()
-		{
-			var b = base.ToString();
-			return $"{b} {Source}<=>{Destination} {(IsDisposed ? "Disposed" + _disposedComment : "NotDisposed")}";
-		}
+            try
+            {
+                Profiling.Stamp(TraceCategory.Misc, "处理源数据...");
+                StatService.Instance.MaxBufferUsage(bytesRead, $"{GetType().Name} src");
 
-		protected virtual void Dispose(bool managed)
-		{
-			bool isResigned;
-
-			if (IsDisposed)
-			{
-				return;
-			}
-
-			lock (_disposingSync)
-			{
-				if (IsDisposed)
-				{
-					return;
-				}
-				IsDisposed = true;
-				isResigned = IsResigned;
-			}
-
-			try
-			{
-
-				if (isResigned)
-				{
-					_disposedComment += " Resigned";
-					if (Thread.CurrentThread != _sourceReaderThread)
-					{
-						// Actually should not happen! Only source reader therad should request resignation
-						try
-						{
-							// thread is locked by syncronious read. And I don't want to drop connection!
-							_sourceReaderThread?.Abort();
-							Trace.WriteLine(TraceCategory.ObjectLive, "Resingning - Aborted");
-						}
-						catch (Exception ex)
-						{
-							Trace.TraceError(ex.Message);
-						}
-						try
-						{
-							_sourceReaderThread.JoinDebug();
-							Trace.WriteLine(TraceCategory.ObjectLive, "Resingning - Joined");
-						}
-#pragma warning disable CA1031 // Do not catch general exception types
-						catch (Exception ex)
-						{
-							Trace.TraceError(ex.Message);
-						}
-#pragma warning restore CA1031 // Do not catch general exception types
-					}
-					else
-					{
-						Trace.WriteLine(TraceCategory.ObjectLive, "Resingning - From this thread");
-						// will exit and close the thread
-					}
-					_sourceReaderThread = null;
-					return; // the other resurces are not touched during this process
-				}
-
-				// StatService.Instance.HandlerRemove(this);
-
-				// UPSTREAM
-				try
-				{
-					if (_upstreamClient != null)
-					{
-						_upstreamClient?.Close();
-						_upstreamClient?.Dispose();
-						Trace.WriteLine(TraceCategory.ObjectLive, $"{Client?.GetHashCode():X4} Closing Handler - _upstreamClient closed");
-					}
-				}
-				catch (Exception ex)
-				{
-					Trace.TraceError($"{ex}");
-				}
-				_upstreamClient = null;
-				_targetReaderThread.JoinAbort();
-				Trace.WriteLine(TraceCategory.ObjectLive, $"{Client?.GetHashCode():X4} Closing Handler - upstream joined to {_targetReaderThread?.ManagedThreadId}");
-
-				// SOURCE
-				var client = Client;
-				var stream = Stream;
-				try
-				{
-					// graceful tcp shutdown
-					client?.Client?.Shutdown(SocketShutdown.Both);
-				}
-				catch { }
-				try
-				{
-					client?.Close();
-					// Client = null;
-				}
-				catch { }
-				try
-				{
-					stream?.Close();
-					// Stream = null;
-				}
-				catch { }
-				_sourceReaderThread.JoinAbort();
-			}
-			finally
-			{
-				Trace.WriteLine(TraceCategory.ObjectLive, $"{Client?.GetHashCode():X4} Disposed Handler. {_disposedComment}");
-			}
-		}
-
-#endregion
-		/*
-		void ReceivedHandshake(IAsyncResult ar)
-		{
-			try
-			{
-				int count;
-				_bufferReceivedCount += count = Stream.EndRead(ar);
-
-				if (count == 0 || !Client.Connected)
-				{
-					Dispose();
-					return;
-				}
+                if (_isReadHandshake)
+                {
+                    _bufferReceivedCount += bytesRead;
 
 #if DEBUG
-				Trace.TraceError($"{Source} Handshake... {_bufferReceivedCount} bytes, first 0x{_buffer[HandshakeStartPos]:X2} {_utf8.GetString(_buffer, HandshakeStartPos, 1)} {Preview(_buffer, HandshakeStartPos, _bufferReceivedCount)}");
+                    Trace.TraceError($"{Source} 握手... {_bufferReceivedCount} 字节, " +
+                        $"首字节 0x{_buffer[HandshakeStartPos]:X2} " +
+                        $"{_utf8.GetString(_buffer, HandshakeStartPos, 1)} " +
+                        $"{Preview(_buffer, HandshakeStartPos, _bufferReceivedCount)}");
 #endif
-				HandshakeHandler();
-			}
-			catch (Exception ex)
-			{
-				Trace.TraceError("Handshake: " + ex);
-				Dispose();
-			}
-		}
-		*/
+                    HandshakeHandler();
+                }
+                else
+                {
+                    _upstreamClient.Write(_buffer, 0, bytesRead);
+                }
 
-		/// <summary>
-		/// Update incomming headers. Can be called mupltiple times.
-		/// To read headers - see the _buffer & _bufferReceivedCount
-		/// To resubscribe - call EnsureReaded(n) and return on false
-		/// or just ReadMoreHandshake() and return
-		/// </summary>
-		protected abstract void HandshakeHandler();
+                Profiling.Stamp(TraceCategory.Misc, "源数据处理完成");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"处理源数据时出错: {ex.Message}");
+                Dispose();
+                return false;
+            }
+        }
 
-		/// <summary>
-		/// Incremental header reading
-		/// </summary>
-		protected bool EnsureReaded(int readed)
-		{
-			if (_bufferReceivedCount < readed)
-			{
-				ReadMoreHandshake();
-				return false;
-			}
-			return true;
-		}
+        /// <summary>
+        /// 开始目标数据读取线程
+        /// </summary>
+        protected void BeginReadTarget()
+        {
+            if (IsDisposed)
+                throw new ObjectDisposedException(nameof(Handler));
 
-		// [Obsolete]
-		protected void ReadMoreHandshake()
-		{
-			/*
-			Stream.BeginRead(_buffer
-				, HandshakeStartPos + _bufferReceivedCount
-				, _buffer.Length - _bufferReceivedCount - HandshakeStartPos
-				, ReceivedHandshake
-				, null);
-			*/
-			// already scheduled. Just exit the call and you find yourself in while(true) source.Read();
-		}
+            Profiling.Stamp(TraceCategory.Misc, "开始读取目标数据...");
 
-		protected void BeginStreaming()
-		{
-			BeginReadSource();
-			BeginReadTarget();
-		}
+            _targetReaderThread = new Thread(TargetReaderThreadWorker)
+            {
+                IsBackground = true,
+                Name = $"Target Reader: {GetType().Name} {Destination}"
+            };
 
-		void SourceReaderThreadWorker()
-		{
-			Trace.WriteLine(TraceCategory.ObjectLive, $"Starting thread {Thread.CurrentThread.Name}");
-			try
-			{
-				while (!IsDisposed)
-				{
-                    if (Client.Available <= 0) continue;
-                    var c = Stream.Read(_buffer, _bufferReceivedCount, _buffer.Length - _bufferReceivedCount);
-					Trace.WriteLine(TraceCategory.ObjectLive, $"Unlocked thread {Thread.CurrentThread.Name}");
-					if (!SourceReceived(c))
-					{
-						break;
-					}
-				}
-			}
-			catch (Exception ex) when (ex.IsConnectionClosing())
-			{
-			}
-			catch (Exception ex)
-			{
-				Trace.TraceError(ex.ToString());
-			}
-			finally
-			{
-				Dispose();
-				Trace.WriteLine(TraceCategory.ObjectLive, $"Closing thread {Thread.CurrentThread.Name}");
-			}
-		}
+            _targetReaderThread.Start();
+            ObjectTracker.Default.Register(_targetReaderThread);
+        }
 
-		void BeginSourceReader()
-		{
-			if (IsDisposed) throw new ObjectDisposedException("");
-			if (_sourceReaderThread != null) throw new Exception("_sourceReaderThread already exists");
+        /// <summary>
+        /// 目标数据读取线程工作方法
+        /// </summary>
+        private void TargetReaderThreadWorker()
+        {
+            Trace.WriteLine(TraceCategory.ObjectLive,
+                $"启动线程 {Thread.CurrentThread.ManagedThreadId} {Thread.CurrentThread.Name}");
 
-			_sourceReaderThread = new Thread(SourceReaderThreadWorker);
-			ObjectTracker.Default.Register(_sourceReaderThread);
-			_sourceReaderThread.IsBackground = true;
-			_sourceReaderThread.Name = $"Source Reader: {GetType().Name} {Source}";
-			_sourceReaderThread.Start();
-		}
+            try
+            {
+                while (!IsDisposed)
+                {
+                    var bytesRead = _upstreamClient.Read(_bufferTarget, 0, _bufferTarget.Length);
+                    if (!TargetReceived(bytesRead))
+                    {
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex) when (ex.IsConnectionClosing())
+            {
+                // 正常的连接关闭
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"目标数据读取错误: {ex}");
+            }
+            finally
+            {
+                Dispose();
+                Trace.WriteLine(TraceCategory.ObjectLive,
+                    $"关闭线程 {Thread.CurrentThread.ManagedThreadId} {Thread.CurrentThread.Name}");
+            }
+        }
 
-		protected void BeginReadSource()
-		{
-			if (IsDisposed) throw new ObjectDisposedException("");
+        /// <summary>
+        /// 处理接收到的目标数据
+        /// </summary>
+        private bool TargetReceived(int bytesRead)
+        {
+            if (IsDisposed || bytesRead <= 0)
+            {
+                Dispose();
+                return false;
+            }
 
-			Profiling.Stamp(TraceCategory.Misc, "BeginReadSource...");
+            try
+            {
+                StatService.Instance.MaxBufferUsage(bytesRead, $"{GetType().Name} trg");
 
-			// lock (_isReaderSync)
-			{
-				_isReadHandshake = false;
-				_bufferReceivedCount = 0;
-			}
-		}
+                Trace.WriteLine(TraceCategory.NetworkingData,
+                    $"{Source} <<< {bytesRead} 字节 <<< {Destination} " +
+                    $"{Preview(_bufferTarget, 0, bytesRead)}");
 
-		/*
-		void SourceReceived(IAsyncResult ar)
-		{
-			Profiling.Stamp("SourceReceived...");
+                Stream.Write(_bufferTarget, 0, bytesRead);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"处理目标数据时出错: {ex.Message}");
+                Dispose();
+                return false;
+            }
+        }
 
-			if (IsDisposed)
-			{
-				return;
-			}
-			try
-			{
-				var c = Stream.EndRead(ar);
-				if (SourceReceived(c))
-				{
-					Stream.BeginRead(_buffer, 0, _buffer.Length, SourceReceived, null);
-				}
-			}
-			catch (Exception ex)
-			{
-				if (!ex.IsConnectionClosing())
-				{
-					Trace.TraceError("Streaming - received from client: " + ex);
-				}
-				Dispose();
-			}
-
-			Profiling.Stamp("SourceReceived done");
-		}
-		*/
-
-		bool SourceReceived(int c)
-		{
-			if (IsDisposed)
-			{
-				return false;
-			}
-			if (c > 0)
-			{
-				Profiling.Stamp(TraceCategory.Misc, "SourceReceived...");
-				StatService.Instance.MaxBufferUsage(c, GetType().Name + " src");
-
-				if (_isReadHandshake)
-				{
-					_bufferReceivedCount += c;
-
-					// a handshake must forward the rest of buffer in case extra data
-					// TODO automate this
-
+        /// <summary>
+        /// 预览数据内容
+        /// </summary>
+        private static string Preview(byte[] buf, int pos, int cnt)
+        {
 #if DEBUG
-					Trace.TraceError($"{Source} Handshake... {_bufferReceivedCount} bytes, first 0x{_buffer[HandshakeStartPos]:X2} {_utf8.GetString(_buffer, HandshakeStartPos, 1)} {Preview(_buffer, HandshakeStartPos, _bufferReceivedCount)}");
+            var previewLength = Math.Min(cnt, 32);
+            var chars = _utf8.GetChars(buf, pos, previewLength);
+
+            for (var i = 0; i < chars.Length; i++)
+            {
+                if (chars[i] < 32)
+                {
+                    chars[i] = '?';
+                }
+            }
+
+            return new string(chars) + (previewLength < cnt ? "..." : "");
+#else
+                    return string.Empty;
 #endif
+        }
 
+        /// <summary>
+        /// 向目标发送数据
+        /// </summary>
+        protected void SendForward(byte[] buf, int pos = 0, int cnt = -1)
+        {
+            if (buf == null)
+                throw new ArgumentNullException(nameof(buf));
 
-					HandshakeHandler();
-					return true;
-				}
-				else
-				{
-					_upstreamClient.Write(_buffer, 0, c);
-				}
+            if (cnt == -1)
+                cnt = buf.Length;
 
-				Profiling.Stamp(TraceCategory.Misc, "SourceReceived done");
-				return true;
-			}
-			else
-			{
-				Dispose();
-			}
+            try
+            {
+                Trace.WriteLine(TraceCategory.NetworkingData,
+                    $"{Source} >>> 发送 {cnt} 字节 >>> {Destination} {Preview(buf, pos, cnt)}");
 
-			return false;
-		}
+                _upstreamClient.Write(buf, pos, cnt);
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"发送数据时出错: {ex.Message}");
+                Dispose();
+                throw;
+            }
+        }
 
-		protected void SendForward(byte[] buf, int pos = 0, int cnt = -1)
-		{
-			if (buf is null)
-			{
-				throw new ArgumentNullException(nameof(buf));
-			}
+        /// <summary>
+        /// 建立上游连接
+        /// </summary>
+        protected void EstablishUpstream(DestinationIdentifier target)
+        {
+            if (IsDisposed) throw new ObjectDisposedException(nameof(Handler));
+            if (target == null) throw new ArgumentNullException(nameof(target));
 
-			if (cnt == -1)
-			{
-				cnt = buf.Length;
-			}
+            Profiling.Stamp(TraceCategory.Networking, "建立上游连接...");
 
-			Trace.WriteLine(TraceCategory.NetworkingData, $"{Source} >>> send {cnt} bytes >>> {Destination} {Preview(buf, pos, cnt)}");
-			_upstreamClient.Write(buf, pos, cnt);
-		}
+            try
+            {
+                _target = target;
+                Trace.WriteLine(TraceCategory.Networking, $"{Source} 路由到 {Destination}");
 
-		void TargetReaderThreadWorker()
-		{
-			Trace.WriteLine(TraceCategory.ObjectLive, $"Starting thread {Thread.CurrentThread.ManagedThreadId} {Thread.CurrentThread.Name}");
-			try
-			{
-				while (!IsDisposed)
-				{
-					var c = _upstreamClient.Read(_bufferTarget, 0, _bufferTarget.Length);
-					if (!TargetReceived(c))
-					{
-						break;
-					}
-				}
-			}
-			catch (Exception ex) when (ex.IsConnectionClosing())
-			{
-			}
-			catch (Exception ex)
-			{
-				Trace.TraceError(ex.ToString());
-			}
-			finally
-			{
-				Dispose();
-				Trace.WriteLine(TraceCategory.ObjectLive, $"Closing thread {Thread.CurrentThread.ManagedThreadId} {Thread.CurrentThread.Name}");
-			}
-		}
+                var streamOverride = Resolver.GetStreamOverride(target);
+                if (streamOverride != null)
+                {
+                    _upstreamClient = streamOverride;
+                    return;
+                }
 
-		protected void BeginReadTarget()
-		{
-			Profiling.Stamp(TraceCategory.Misc, "BeginReadTarget...");
-			_targetReaderThread = new Thread(TargetReaderThreadWorker);
-			_targetReaderThread.IsBackground = true;
-			_targetReaderThread.Name = $"Target Reader: {GetType().Name} {Destination}";
-			_targetReaderThread.Start();
-			ObjectTracker.Default.Register(_targetReaderThread);
+                // 处理代理链
+                foreach (var proxy in Server.Chain)
+                {
+                    var clientType = Resolver.GetClientType(proxy.Uri);
+                    var clientStream = (ClientStream)Activator.CreateInstance(clientType);
 
-			// _upstreamClient.BeginRead(_bufferTarget, 0, _bufferTarget.Length, TargetReceived, null);
-		}
+                    if (_upstreamClient == null)
+                    {
+                        clientStream.Plug(proxy.Uri);
+                    }
+                    else
+                    {
+                        ((ClientStream)_upstreamClient).Route(proxy.Uri);
+                        clientStream.Plug(proxy.Uri, (ClientStream)_upstreamClient);
+                    }
+                    _upstreamClient = clientStream;
+                }
 
-		string Source
-		{
-			get
-			{
-				return $"{Client?.GetHashCode():X4} {Client?.Client?.RemoteEndPoint}";
-			}
-		}
+                // 设置最终目标
+                if (_upstreamClient != null)
+                {
+                    var client = (ClientStream)_upstreamClient;
+                    client.Route(target.Host ?? target.IPAddress.ToString(), target.Port);
+                }
+                else
+                {
+                    // 直接连接
+                    _upstreamClient = new NullClientStream();
+                    ((ClientStream)_upstreamClient).Plug(
+                        target.Host ?? target.IPAddress.ToString(),
+                        target.Port
+                    );
+                }
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
 
-		string Destination
-		{
-			get
-			{
-				if (_target != null)
-				{
-					return $"{_target.Host}{_target.IPAddress}:{_target.Port}";
-				}
-				if (_upstreamClient is ClientStream cs)
-				{
-					return cs?.Client?.Client?.RemoteEndPoint?.ToString();
-				}
-				return null;
-			}
-		}
+            Profiling.Stamp(TraceCategory.Networking, "连接已建立");
+        }
 
-		/*
-		private void TargetReceived(IAsyncResult ar)
-		{
-			if (IsDisposed)
-			{
-				return;
-			}
+        public override string ToString()
+        {
+            var baseName = base.ToString();
+            return $"{baseName} {Source}<=>{Destination} " +
+                   $"{(IsDisposed ? "已释放" + _disposedComment : "未释放")}";
+        }
+        #region IDisposable 实现
 
-			Profiling.Stamp($"TargetReceived... from {_upstreamClient?.GetType()?.Name}");
-			try
-			{
-				var c = _upstreamClient.EndRead(ar);
-				if (TargetReceived(c))
-				{
-					_upstreamClient.BeginRead(_bufferTarget, 0, _buffer.Length, TargetReceived, null);
-				}
-			}
-			catch (Exception ex)
-			{
-				Trace.TraceError("Streaming - received from client: " + ex);
-				Dispose();
-			}
-			Profiling.Stamp("TargetReceived done");
-		}
-		*/
+        public void Dispose()
+        {
+            Dispose(true);
+        }
 
-		private bool TargetReceived(int c)
-		{
-			if (IsDisposed)
-			{
-				return false;
-			}
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!disposing || IsDisposed) return;
 
-			if (c > 0)
-			{
-				StatService.Instance.MaxBufferUsage(c, GetType().Name + " trg");
-				Trace.WriteLine(TraceCategory.NetworkingData, $"{Source} <<< {c} bytes <<< {Destination} {Preview(_bufferTarget, 0, c)}");
-				Stream.Write(_bufferTarget, 0, c);
-				return true;
-			}
-			else
-			{
-				Dispose();
-				return false;
-			}
+            lock (_disposingSync)
+            {
+                if (IsDisposed) return;
 
-		}
+                try
+                {
+                    HandleResignedDisposal();
+                    DisposeResources();
+                }
+                finally
+                {
+                    IsDisposed = true;
+                    Trace.WriteLine(TraceCategory.ObjectLive,
+                        $"{Client?.GetHashCode():X4} Handler已释放. {_disposedComment}");
+                }
+            }
+        }
 
-		private static string Preview(byte[] buf, int pos, int cnt)
-		{
-			#if DEBUG
-			var lim = Math.Min(cnt, 32);
-			var str = _utf8.GetChars(buf, pos, lim);
-			for (var i = 0; i < str.Length; i++)
-			{
-				if (str[i] < 32)
-				{
-					str[i] = '?';
-				}
-			}
-			return new string(str) + (lim < cnt ? "..." : "");
-			#else
-			return string.Empty;
-			#endif
-		}
+        /// <summary>
+        /// 处理已注销Handler的释放
+        /// </summary>
+        private void HandleResignedDisposal()
+        {
+            if (!_isResigned) return;
 
-		protected void EstablishUpstream(DestinationIdentifier target)
-		{
-			if (IsDisposed) throw new ObjectDisposedException("");
+            _disposedComment += " 已注销";
 
-			Profiling.Stamp(TraceCategory.Networking, "EstablishUpstream...");
+            if (Thread.CurrentThread != _sourceReaderThread)
+            {
+                try
+                {
+                    // 中止源读取线程
+                    _sourceReaderThread?.Abort();
+                    Trace.WriteLine(TraceCategory.ObjectLive, "注销 - 已中止");
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceError($"中止源读取线程时出错: {ex.Message}");
+                }
 
-			try
-			{
-				if (target is null)
-				{
-					throw new ArgumentNullException(nameof(target));
-				}
+                try
+                {
+                    _sourceReaderThread?.Join(THREAD_JOIN_TIMEOUT);
+                    Trace.WriteLine(TraceCategory.ObjectLive, "注销 - 已加入");
+                }
+                catch (Exception ex)
+                {
+                    Trace.TraceError($"等待源读取线程时出错: {ex.Message}");
+                }
+            }
+            else
+            {
+                Trace.WriteLine(TraceCategory.ObjectLive, "注销 - 来自当前线程");
+            }
 
-				_target = target;
-				Trace.WriteLine(TraceCategory.Networking, $"{Source} Route to {Destination}");
+            _sourceReaderThread = null;
+        }
 
-				/*
-				string ep;
-				if (string.IsNullOrEmpty(target.Host)) {
-					ep = target.IPEndPoint.ToString();
-				}
-				else
-				{
-					ep = target.Host + ":" + target.Port;
-				}
+        /// <summary>
+        /// 释放所有资源
+        /// </summary>
+        private void DisposeResources()
+        {
+            try
+            {
+                // 关闭并释放上游客户端
+                if (_upstreamClient != null)
+                {
+                    _upstreamClient.Close();
+                    _upstreamClient.Dispose();
+                    Trace.WriteLine(TraceCategory.ObjectLive,
+                        $"{Client?.GetHashCode():X4} 关闭Handler - 上游客户端已关闭");
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"关闭上游客户端时出错: {ex}");
+            }
+            finally
+            {
+                _upstreamClient = null;
+            }
 
-				if (Server.Config.EndPoints.Any(x => x.ToString() == ep))
-				{
-					//Add random header for http handler - prevent loop for localhost:1080
-					// redirrect self-loop to _river;
-					ep = "_river" + ":" + target.Port;
-				}
-				*/
+            try
+            {
+                // 等待目标读取线程结束
+                if (_targetReaderThread != null)
+                {
+                    _targetReaderThread.Join(THREAD_JOIN_TIMEOUT);
+                    Trace.WriteLine(TraceCategory.ObjectLive,
+                        $"{Client?.GetHashCode():X4} 关闭Handler - 目标线程已加入到 {_targetReaderThread?.ManagedThreadId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"等待目标读取线程时出错: {ex}");
+            }
 
-				var ov = Resolver.GetStreamOverride(target);
-				if (ov != null)
-				{
-					_upstreamClient = ov;
-				}
-				else
-				{
-					foreach (var proxy in Server.Chain)
-					{
-						var clientType = Resolver.GetClientType(proxy.Uri);
-						var clientStream = (ClientStream)Activator.CreateInstance(clientType);
-						if (_upstreamClient == null)
-						{
-							// create a first client connection
-							clientStream.Plug(proxy.Uri);
-						}
-						else
-						{
-							// route in old client
-							((ClientStream)_upstreamClient).Route(proxy.Uri);
+            try
+            {
+                // 关闭客户端连接
+                if (Client?.Client != null)
+                {
+                    // 优雅地关闭TCP连接
+                    Client.Client.Shutdown(SocketShutdown.Both);
+                    Client.Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"关闭客户端连接时出错: {ex}");
+            }
 
-							// and now wrap to new one
-							clientStream.Plug(proxy.Uri, _upstreamClient);
-						}
-						_upstreamClient = clientStream;
-					}
-					if (_upstreamClient != null)
-					{
-						var client = (ClientStream)_upstreamClient;
-						client.Route(target.Host ?? target.IPAddress.ToString(), target.Port);
-					}
-					else
-					{
-						// dirrect connection
-						_upstreamClient = new NullClientStream();
-						var host = target.Host ?? target.IPAddress.ToString();
-						var port = target.Port;
-						((ClientStream)_upstreamClient).Plug(host, port);
-					}
-				}
-			}
-			catch
-			{
-				Dispose();
-				throw;
-			}
-			Profiling.Stamp(TraceCategory.Networking, "Established");
-		}
+            try
+            {
+                // 关闭流
+                Stream?.Close();
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"关闭流时出错: {ex}");
+            }
 
+            // 等待源读取线程结束
+            try
+            {
+                _sourceReaderThread?.Join(THREAD_JOIN_TIMEOUT);
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError($"等待源读取线程时出错: {ex}");
+            }
+        }
 
+        #endregion
 
-	}
+        #region 辅助方法
+
+        /// <summary>
+        /// 启动源数据读取线程
+        /// </summary>
+        private void BeginSourceReader()
+        {
+            if (IsDisposed)
+                throw new ObjectDisposedException(nameof(Handler));
+
+            if (_sourceReaderThread != null)
+                throw new InvalidOperationException("源读取线程已存在");
+
+            _sourceReaderThread = new Thread(SourceReaderThreadWorker)
+            {
+                IsBackground = true,
+                Name = $"Source Reader: {GetType().Name} {Source}"
+            };
+
+            ObjectTracker.Default.Register(_sourceReaderThread);
+            _sourceReaderThread.Start();
+        }
+
+        #endregion
+    }
 }
