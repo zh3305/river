@@ -35,6 +35,8 @@ namespace RiverApp
 
             for (var i = 0; i < args.Length; i++)
             {
+                //去除换行符
+                args[i]= args[i].Replace("\r", "").Replace("\n", "");
                 switch (args[i].ToUpperInvariant())
                 {
                     case "-NAME":
@@ -96,7 +98,7 @@ namespace RiverApp
             {
                 var (server, uri) = servers[index];
                 // for (var i = 0; i < forwarders.Count; i++)
-                for (var i = 0; i < index; i++)
+                for (var i = 0; i <= index; i++)
                 {
                     var fwd = forwarders[i];
                     // var fwd = forwarders[index];

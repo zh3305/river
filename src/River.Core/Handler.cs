@@ -253,7 +253,13 @@ namespace River
                     HandshakeHandler();
                 }
                 else
-                {
+                { // 添加空检查
+                    if (_upstreamClient == null)
+                    {
+                        Trace.TraceError("上游客户端未初始化");
+                        Dispose();
+                        return false;
+                    }
                     _upstreamClient.Write(_buffer, 0, bytesRead);
                 }
 
