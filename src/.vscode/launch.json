@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch RiverApp",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "restore-and-build",
+            "program": "${workspaceFolder}\\RiverApp\\bin\\Debug\\RiverApp.exe",
+            "args": [
+                "-L", "socks://0.0.0.0:1080",
+                "-L", "socks://0.0.0.0:1081",
+                "-L", "socks://0.0.0.0:1082",
+                "-F", "http://rs:rs@117.28.246.21:444",
+                "-F", "http://rs:rs@43.159.142.189:444",
+                "-F", "socks5://czcompl123_custom_zone_US_st_Arizona_city_Chandler_sid_34428317_time_1440:asd123123@us.swiftproxy.net:7878"
+            ],
+            "cwd": "${workspaceFolder}\\RiverApp\\bin\\Debug\\",
+            "stopAtEntry": false,
+            "env": {
+                "ASPNETCORE_ENVIRONMENT": "Development"
+            }
+        }
+    ]
+}

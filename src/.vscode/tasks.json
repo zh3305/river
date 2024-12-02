@@ -1,0 +1,39 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "restore",
+            "command": "E:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Current\\Bin\\amd64\\MSBuild.exe",
+            "type": "shell",
+            "args": [
+              "${workspaceFolder}/RiverApp/RiverApp.csproj",
+              "/t:Restore"
+            ],
+            "problemMatcher": [],
+            "group": {
+              "kind": "build",
+              "isDefault": true
+            }
+          },
+        {
+            "label": "build",
+            "command": "E:\\Program Files\\Microsoft Visual Studio\\2022\\Enterprise\\MSBuild\\Current\\Bin\\amd64\\MSBuild.exe",
+            "type": "process",
+            "args": [
+                "${workspaceFolder}\\RiverApp\\RiverApp.csproj",
+                "/t:Build",
+                "/p:Configuration=Debug"
+            ],
+            "problemMatcher": "$msCompile"
+        },
+        {
+            "label": "restore-and-build",
+            "dependsOn": ["restore", "build"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        }
+    ]
+}
